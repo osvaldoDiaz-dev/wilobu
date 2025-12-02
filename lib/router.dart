@@ -1,4 +1,3 @@
-// lib/router.dart
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -11,13 +10,14 @@ import 'features/auth/presentation/register_page.dart';
 import 'features/home/presentation/home_page.dart';
 import 'features/devices/presentation/add_device_page.dart';
 
-/// Pequeño helper para que GoRouter se refresque cuando cambia un Stream.
-/// (equivalente al GoRouterRefreshStream de los ejemplos oficiales).
+/// Clase Helper para convertir un Stream (como authStateChanges)
+/// en un Listenable que GoRouter pueda escuchar para refrescar rutas.
 class GoRouterRefreshStream extends ChangeNotifier {
   GoRouterRefreshStream(Stream<dynamic> stream) {
-    _subscription = stream.listen((_) {
-      notifyListeners();
-    });
+    notifyListeners();
+    _subscription = stream.listen(
+      (dynamic _) => notifyListeners(),
+    );
   }
 
   late final StreamSubscription<dynamic> _subscription;
@@ -36,26 +36,28 @@ final appRouterProvider = Provider<GoRouter>((ref) {
     initialLocation: '/login',
     debugLogDiagnostics: true,
 
-    // Se refresca cuando cambia el estado de autenticación
+    // Escucha cambios en la autenticación para reevaluar la redirección
     refreshListenable: GoRouterRefreshStream(auth.authStateChanges()),
 
-    // Lógica de redirección según sesión
+    // Lógica de protección de rutas
     redirect: (context, state) {
-      final loggedIn = auth.currentUser != null;
-      final loggingIn =
-          state.uri.path == '/login' || state.uri.path == '/register';
+      final user = auth.currentUser;
+      final isLoggedIn = user != null;
+      
+      final isLoggingIn = state.uri.path == '/login' || state.uri.path == '/register';
 
-      if (!loggedIn) {
-        // No logueado: solo permitimos /login y /register
-        return loggingIn ? null : '/login';
+      // 1. Si NO está logueado y no está en login/register -> ir a Login
+      if (!isLoggedIn) {
+        return isLoggingIn ? null : '/login';
       }
 
-      // Logueado: si intenta ir a /login o /register, lo mandamos a /home
-      if (loggingIn) {
+      // 2. Si SI está logueado y trata de ir a login/register -> ir a Home
+      if (isLoggingIn) {
         return '/home';
       }
 
-      return null; // sin redirección
+      // 3. En cualquier otro caso, dejar pasar
+      return null;
     },
 
     routes: <RouteBase>[

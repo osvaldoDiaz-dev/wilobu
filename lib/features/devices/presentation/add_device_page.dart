@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
@@ -8,13 +9,9 @@ import 'package:go_router/go_router.dart';
 
 import 'package:wilobu_app/firebase_providers.dart';
 
-/// Modelo sencillo para representar un Wilobu visible por BLE.
+/// Modelo local para la vista
 class NearbyWilobu {
-  NearbyWilobu({
-    required this.device,
-    required this.code,
-  });
-
+  NearbyWilobu({required this.device, required this.code});
   final BluetoothDevice device;
   final String code;
 }
@@ -26,15 +23,28 @@ class AddDevicePage extends ConsumerStatefulWidget {
   ConsumerState<AddDevicePage> createState() => _AddDevicePageState();
 }
 
-class _AddDevicePageState extends ConsumerState<AddDevicePage> {
-  // BLE
-  final FlutterBluePlus _ble = FlutterBluePlus.instance;
+class _AddDevicePageState extends ConsumerState<AddDevicePage>
+    with SingleTickerProviderStateMixin {
+  // ---------------------------------------------------------------------------
+  // CONTROLADORES DE UI & ANIMACIÓN
+  // ---------------------------------------------------------------------------
+  late PageController _pageController;
+  late AnimationController _pulseController;
+  
+  // 0: Escaneo, 1: Formulario Configuración
+  int _currentStep = 0;
+
+  // ---------------------------------------------------------------------------
+  // ESTADO BLE
+  // ---------------------------------------------------------------------------
   StreamSubscription<List<ScanResult>>? _scanSub;
   bool _isScanning = false;
   List<NearbyWilobu> _nearby = [];
-  NearbyWilobu? _selectedWilobu;
+  NearbyWilobu? _selectedWilobu; // null si es entrada manual
 
-  // Formulario
+  // ---------------------------------------------------------------------------
+  // ESTADO FORMULARIO
+  // ---------------------------------------------------------------------------
   final _formKey = GlobalKey<FormState>();
   final _nameController = TextEditingController();
   final _ownerController = TextEditingController();
@@ -46,9 +56,29 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
   bool _manualCodeMode = false;
   bool _saving = false;
 
+  // UUID de servicio Wilobu (ajustar según tu firmware real)
+  static const String _wilobuServiceUuid = '0000ffaa-0000-1000-8000-00805f9b34fb';
+
+  @override
+  void initState() {
+    super.initState();
+    _pageController = PageController();
+    
+    // Animación de "radar"
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
+
+    // Iniciar escaneo automáticamente al entrar para reducir fricción
+    _startScan();
+  }
+
   @override
   void dispose() {
     _stopScan();
+    _pulseController.dispose();
+    _pageController.dispose();
     _nameController.dispose();
     _ownerController.dispose();
     _codeController.dispose();
@@ -57,10 +87,9 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
     super.dispose();
   }
 
-  /// REGLA DE NEGOCIO IMPORTANTE:
-  /// Cómo detectamos un Wilobu en el escaneo.
-  /// Ahora mismo: por nombre que empieza con "Wilobu" o servicio con UUID fijo.
-  static const String _wilobuServiceUuid = '0000ffaa-0000-1000-8000-00805f9b34fb';
+  // ---------------------------------------------------------------------------
+  // LÓGICA BLE
+  // ---------------------------------------------------------------------------
 
   bool _isWilobuDevice(ScanResult r) {
     final name = (r.device.platformName.isNotEmpty
@@ -68,7 +97,10 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
             : r.device.remoteId.str)
         .toUpperCase();
 
+    // Filtro 1: Nombre
     if (name.contains('WILOBU')) return true;
+    
+    // Filtro 2: Service UUID
     if (r.advertisementData.serviceUuids
         .map((u) => u.toString().toLowerCase())
         .contains(_wilobuServiceUuid)) {
@@ -77,18 +109,21 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
     return false;
   }
 
-  /// Cómo extraemos el “código Wilobu” de un dispositivo BLE.
-  /// De momento usamos el ID de dispositivo (MAC/UUID). Cuando el firmware
-  /// lo exponga en un characteristic o manufacturer data, aquí se ajusta.
   String _codeFromScanResult(ScanResult r) {
+    // TODO: En producción leer esto de ManufacturerData o Characteristic
     return r.device.remoteId.str;
   }
 
   Future<void> _ensureBleReady() async {
-    // Aquí es donde luego puedes pedir permisos runtime (location, BT, etc.)
-    // y mostrar diálogos si algo falta. Por ahora solo intentamos encender BT.
-    if (!(await _ble.isOn)) {
-      await FlutterBluePlus.turnOn(); // abre diálogo del sistema si aplica
+    final state = await FlutterBluePlus.adapterState.first;
+    if (state != BluetoothAdapterState.on) {
+      if (Platform.isAndroid) {
+        try {
+          await FlutterBluePlus.turnOn();
+        } catch (e) {
+          debugPrint('Error al encender BT: $e');
+        }
+      }
     }
   }
 
@@ -98,24 +133,23 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
     setState(() {
       _isScanning = true;
       _nearby = [];
-      _selectedWilobu = null;
-      if (!_manualCodeMode) {
-        _codeController.clear();
-      }
     });
 
     await _ensureBleReady();
-
-    // Cancelar suscripción previa si existiera
     await _scanSub?.cancel();
 
-    // Escaneo de 6 segundos
-    await _ble.startScan(
-      timeout: const Duration(seconds: 6),
-      androidUsesFineLocation: true,
-    );
+    try {
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 8), // Un poco más de tiempo
+        androidUsesFineLocation: true,
+      );
+    } catch (e) {
+      debugPrint('Scan error: $e');
+      if (mounted) setState(() => _isScanning = false);
+      return;
+    }
 
-    _scanSub = _ble.scanResults.listen((results) {
+    _scanSub = FlutterBluePlus.scanResults.listen((results) {
       final filtered = results.where(_isWilobuDevice).map((r) {
         return NearbyWilobu(
           device: r.device,
@@ -123,21 +157,21 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
         );
       }).toList();
 
-      // Evitar duplicados por id
+      // Deduplicar por ID
       final byId = <String, NearbyWilobu>{};
       for (final w in filtered) {
         byId[w.device.remoteId.str] = w;
       }
 
-      setState(() {
-        _nearby = byId.values.toList();
-      });
+      if (mounted) {
+        setState(() {
+          _nearby = byId.values.toList();
+        });
+      }
     });
 
-    // Cuando timeout se cumple, stopScan será llamado internamente,
-    // pero mantenemos el flag local en sync.
-    Future.delayed(const Duration(seconds: 6), () {
-      if (mounted) {
+    Future.delayed(const Duration(seconds: 8), () {
+      if (mounted && _isScanning) {
         setState(() => _isScanning = false);
       }
     });
@@ -146,57 +180,55 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
   Future<void> _stopScan() async {
     await _scanSub?.cancel();
     _scanSub = null;
-    if (_isScanning) {
-      await _ble.stopScan();
+    if (FlutterBluePlus.isScanningNow) {
+      await FlutterBluePlus.stopScan();
     }
-    _isScanning = false;
+    if (mounted) setState(() => _isScanning = false);
   }
 
-  void _onSelectWilobu(NearbyWilobu w) {
+  // ---------------------------------------------------------------------------
+  // NAVEGACIÓN Y ACCIONES
+  // ---------------------------------------------------------------------------
+
+  void _onDeviceSelected(NearbyWilobu w) {
+    _stopScan();
     setState(() {
       _selectedWilobu = w;
       _manualCodeMode = false;
       _codeController.text = w.code;
+      // Pre-llenar nombre si es posible o dejar vacío
+      _nameController.text = w.device.platformName; 
     });
+    _goToStep(1);
   }
 
-  void _toggleManualCode() {
+  void _onManualEntry() {
+    _stopScan();
     setState(() {
-      _manualCodeMode = !_manualCodeMode;
-      if (_manualCodeMode) {
-        _selectedWilobu = null;
-        _nearby = [];
-        _codeController.clear();
-      } else {
-        // volvemos a modo "código desde BLE"
-      }
+      _selectedWilobu = null;
+      _manualCodeMode = true;
+      _codeController.clear();
+      _nameController.clear();
     });
+    _goToStep(1);
+  }
+
+  void _goToStep(int step) {
+    setState(() => _currentStep = step);
+    _pageController.animateToPage(
+      step,
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOut,
+    );
   }
 
   Future<void> _save() async {
     final auth = ref.read(firebaseAuthProvider);
     final firestore = ref.read(firestoreProvider);
-
     final user = auth.currentUser;
-    if (user == null) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Debes iniciar sesión para registrar un Wilobu.')),
-      );
-      return;
-    }
 
-    if (!_formKey.currentState!.validate()) {
-      return;
-    }
-
-    final code = _codeController.text.trim();
-    if (code.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Ingresa o selecciona un código Wilobu.')),
-      );
-      return;
-    }
+    if (user == null) return;
+    if (!_formKey.currentState!.validate()) return;
 
     setState(() => _saving = true);
 
@@ -207,267 +239,318 @@ class _AddDevicePageState extends ConsumerState<AddDevicePage> {
           .collection('devices')
           .add({
         'name': _nameController.text.trim().isEmpty
-            ? 'Mi Wilobu'
+            ? 'Wilobu'
             : _nameController.text.trim(),
         'forWho': _ownerController.text.trim(),
-        'code': code,
-        'hardwareId': code,
+        'code': _codeController.text.trim(),
+        'hardwareId': _codeController.text.trim(),
         'hardwareType': _hardwareType,
         'emergencyContactName': _emergencyNameController.text.trim(),
         'emergencyContactPhone': _emergencyPhoneController.text.trim(),
-        'status': 'Sin conexión',
+        'status': 'Sin conexión', // Estado inicial
         'battery': 0,
         'signal': 0,
         'createdAt': FieldValue.serverTimestamp(),
       });
 
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Wilobu registrado correctamente.')),
-      );
-      context.pop(); // volver al Home
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('¡Wilobu vinculado con éxito!')),
+        );
+        context.pop();
+      }
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error al guardar Wilobu: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // UI BUILDERS
+  // ---------------------------------------------------------------------------
+
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Registrar Wilobu'),
-      ),
-      body: SafeArea(
-        child: Form(
-          key: _formKey,
-          child: ListView(
-            padding: const EdgeInsets.all(16),
+    // Bloquear el back button del sistema si estamos en el paso 2 para volver al 1
+    return PopScope(
+      canPop: _currentStep == 0,
+      onPopInvoked: (didPop) {
+        if (didPop) return;
+        if (_currentStep == 1) {
+          _goToStep(0);
+          // Reiniciar escaneo al volver
+          _startScan();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        appBar: AppBar(
+          title: Text(_currentStep == 0 ? 'Buscar dispositivo' : 'Configurar Wilobu'),
+          centerTitle: true,
+          leading: IconButton(
+            icon: Icon(_currentStep == 0 ? Icons.close : Icons.arrow_back),
+            onPressed: () {
+              if (_currentStep == 1) {
+                _goToStep(0);
+                _startScan();
+              } else {
+                context.pop();
+              }
+            },
+          ),
+        ),
+        body: SafeArea(
+          child: Column(
             children: [
-              // Tarjeta de instrucciones (adaptada a BLE)
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: const [
-                      Text(
-                        'Cómo vincular tu Wilobu',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w600,
-                          fontSize: 16,
-                        ),
-                      ),
-                      SizedBox(height: 12),
-                      Text('1. Enciende el dispositivo Wilobu que quieres vincular.'),
-                      Text(
-                          '2. Acércalo al teléfono (a menos de 1 metro) y asegúrate de que el Bluetooth esté encendido.'),
-                      Text(
-                          '3. Pulsa “Buscar Wilobu cercanos” y selecciona el dispositivo que aparezca en la lista.'),
-                      Text(
-                          '4. Opcional: indica para quién es este Wilobu, un nombre para identificarlo y un contacto de emergencia.'),
-                    ],
-                  ),
-                ),
+              // Indicador de pasos simple
+              LinearProgressIndicator(
+                value: (_currentStep + 1) / 2,
+                backgroundColor: Colors.grey[200],
+                valueColor: AlwaysStoppedAnimation(
+                    Theme.of(context).colorScheme.primary),
               ),
-              const SizedBox(height: 24),
-
-              // BLOQUE: ESCANEO BLE
-              Text(
-                'Wilobus cercanos',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  ElevatedButton.icon(
-                    onPressed: _isScanning ? null : _startScan,
-                    icon: const Icon(Icons.bluetooth_searching),
-                    label: const Text('Buscar Wilobu cercanos'),
-                  ),
-                  const SizedBox(width: 12),
-                  TextButton(
-                    onPressed: _toggleManualCode,
-                    child: Text(_manualCodeMode
-                        ? 'Usar detección automática'
-                        : 'No encuentro mi Wilobu'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              if (_isScanning) ...[
-                Row(
-                  children: const [
-                    SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    SizedBox(width: 8),
-                    Text('Buscando dispositivos...'),
+              Expanded(
+                child: PageView(
+                  controller: _pageController,
+                  physics: const NeverScrollableScrollPhysics(), // Bloquear swipe manual
+                  children: [
+                    _buildScanStep(context),
+                    _buildConfigStep(context),
                   ],
-                ),
-              ] else if (!_manualCodeMode && _nearby.isEmpty) ...[
-                const Text(
-                  'No se encontraron Wilobus todavía. '
-                  'Enciéndelo y vuelve a buscar.',
-                  style: TextStyle(fontSize: 12),
-                ),
-              ] else if (!_manualCodeMode && _nearby.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                ..._nearby.map((w) {
-                  final selected =
-                      _selectedWilobu?.device.remoteId == w.device.remoteId;
-                  return Card(
-                    child: ListTile(
-                      leading: Icon(
-                        Icons.watch_outlined,
-                        color: selected ? theme.colorScheme.primary : null,
-                      ),
-                      title: Text(
-                        w.device.platformName.isNotEmpty
-                            ? w.device.platformName
-                            : 'Wilobu (${w.device.remoteId.str})',
-                      ),
-                      subtitle: Text('Código Wilobu: ${w.code}'),
-                      trailing: selected
-                          ? const Icon(Icons.check_circle, color: Colors.green)
-                          : null,
-                      onTap: () => _onSelectWilobu(w),
-                    ),
-                  );
-                }),
-              ],
-
-              const SizedBox(height: 24),
-
-              // INFORMACIÓN BÁSICA
-              Text(
-                'Información básica',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              TextFormField(
-                controller: _nameController,
-                decoration: const InputDecoration(
-                  prefixIcon: Icon(Icons.watch_outlined),
-                  labelText: 'Nombre para este Wilobu (opcional)',
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _ownerController,
-                decoration: const InputDecoration(
-                  prefixIcon: Icon(Icons.person_outline),
-                  labelText: '¿Para quién es este Wilobu? (opcional)',
-                ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // CÓDIGO WILOBU
-              Text(
-                'Código Wilobu',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              TextFormField(
-                controller: _codeController,
-                readOnly: !_manualCodeMode,
-                decoration: InputDecoration(
-                  prefixIcon: const Icon(Icons.qr_code_2_outlined),
-                  labelText: 'Código Wilobu',
-                  helperText: _manualCodeMode
-                      ? 'Escribe el código tal como aparece en el dispositivo o en la tarjeta.'
-                      : 'Se completa automáticamente al seleccionar un Wilobu cercano.',
-                ),
-                validator: (value) {
-                  if ((value ?? '').trim().isEmpty) {
-                    return 'Selecciona un Wilobu o ingresa el código.';
-                  }
-                  return null;
-                },
-              ),
-
-              const SizedBox(height: 16),
-              DropdownButtonFormField<String>(
-                value: _hardwareType,
-                items: const [
-                  DropdownMenuItem(
-                    value: 'HW-A (prototipo tarjeta Hologram)',
-                    child: Text('HW-A (prototipo tarjeta Hologram)'),
-                  ),
-                  DropdownMenuItem(
-                    value: 'HW-B (futuro prototipo)',
-                    child: Text('HW-B (futuro prototipo)'),
-                  ),
-                ],
-                onChanged: (value) {
-                  if (value != null) {
-                    setState(() => _hardwareType = value);
-                  }
-                },
-                decoration: const InputDecoration(
-                  labelText: 'Tipo de hardware',
-                ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // CONTACTO DE EMERGENCIA
-              Text(
-                'Contacto de emergencia (opcional)',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              TextFormField(
-                controller: _emergencyNameController,
-                decoration: const InputDecoration(
-                  prefixIcon: Icon(Icons.perm_contact_calendar_outlined),
-                  labelText: 'Nombre del contacto',
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _emergencyPhoneController,
-                keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(
-                  prefixIcon: Icon(Icons.phone_outlined),
-                  labelText: 'Teléfono del contacto',
-                ),
-              ),
-
-              const SizedBox(height: 32),
-
-              SizedBox(
-                height: 52,
-                child: FilledButton.icon(
-                  onPressed: _saving ? null : _save,
-                  icon: _saving
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.save_outlined),
-                  label: Text(_saving ? 'Guardando...' : 'Guardar'),
                 ),
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  // --- PASO 1: ESCANEO Y SELECCIÓN ---
+  Widget _buildScanStep(BuildContext context) {
+    final theme = Theme.of(context);
+    final empty = _nearby.isEmpty;
+
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const Spacer(),
+        
+        // Animación Radar
+        Stack(
+          alignment: Alignment.center,
+          children: [
+            if (_isScanning)
+              ScaleTransition(
+                scale: Tween(begin: 0.8, end: 1.4).animate(CurvedAnimation(
+                    parent: _pulseController, curve: Curves.easeOut)),
+                child: FadeTransition(
+                  opacity: Tween(begin: 0.5, end: 0.0).animate(CurvedAnimation(
+                      parent: _pulseController, curve: Curves.easeOut)),
+                  child: Container(
+                    width: 200,
+                    height: 200,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: theme.colorScheme.primary.withOpacity(0.2),
+                    ),
+                  ),
+                ),
+              ),
+            Container(
+              width: 120,
+              height: 120,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: theme.colorScheme.primaryContainer,
+              ),
+              child: Icon(
+                Icons.bluetooth_searching,
+                size: 48,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 32),
+        
+        Text(
+          _isScanning ? 'Buscando Wilobus cercanos...' : 'Búsqueda finalizada',
+          style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Text(
+            'Asegúrate de que el dispositivo esté encendido y cerca de tu teléfono.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodyMedium?.copyWith(color: Colors.grey),
+          ),
+        ),
+        
+        const SizedBox(height: 24),
+
+        // Lista de encontrados o botón de reintentar
+        if (empty && !_isScanning)
+          FilledButton.tonalIcon(
+            onPressed: _startScan,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Volver a buscar'),
+          )
+        else if (!empty)
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              itemCount: _nearby.length,
+              itemBuilder: (context, index) {
+                final w = _nearby[index];
+                return Card(
+                  elevation: 0,
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  margin: const EdgeInsets.only(bottom: 8),
+                  child: ListTile(
+                    leading: const CircleAvatar(child: Icon(Icons.watch)),
+                    title: Text(
+                      w.device.platformName.isNotEmpty
+                          ? w.device.platformName
+                          : 'Wilobu Desconocido',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text('ID: ${w.code}'),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                    onTap: () => _onDeviceSelected(w),
+                  ),
+                );
+              },
+            ),
+          )
+        else
+          const Spacer(), // Relleno si está escaneando pero vacío aún
+
+        // Opción manual siempre visible al fondo
+        Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: TextButton(
+            onPressed: _onManualEntry,
+            child: const Text('¿No lo encuentras? Ingresar código manualmente'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // --- PASO 2: CONFIGURACIÓN ---
+  Widget _buildConfigStep(BuildContext context) {
+    final theme = Theme.of(context);
+    
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24),
+      child: Form(
+        key: _formKey,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Cabecera del dispositivo seleccionado
+            Center(
+              child: Column(
+                children: [
+                  Icon(
+                    _manualCodeMode ? Icons.qr_code : Icons.check_circle_outline,
+                    size: 64,
+                    color: _manualCodeMode ? Colors.grey : Colors.green,
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    _manualCodeMode ? 'Registro Manual' : '¡Dispositivo encontrado!',
+                    style: theme.textTheme.headlineSmall,
+                  ),
+                  if (!_manualCodeMode)
+                    Chip(label: Text('ID: ${_selectedWilobu?.code}')),
+                ],
+              ),
+            ),
+            const SizedBox(height: 32),
+
+            Text('Información General', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 16),
+            
+            TextFormField(
+              controller: _nameController,
+              decoration: const InputDecoration(
+                labelText: 'Nombre del dispositivo',
+                hintText: 'Ej. Reloj de Ana',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.edit_outlined),
+              ),
+              validator: (v) => v!.isEmpty ? 'El nombre es obligatorio' : null,
+            ),
+            const SizedBox(height: 16),
+            
+            TextFormField(
+              controller: _ownerController,
+              decoration: const InputDecoration(
+                labelText: '¿Quién lo usará?',
+                hintText: 'Ej. Ana',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person_outline),
+              ),
+            ),
+
+            if (_manualCodeMode) ...[
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: _codeController,
+                decoration: const InputDecoration(
+                  labelText: 'Código Wilobu (ID)',
+                  hintText: 'Ubicado en la parte trasera',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.qr_code_2),
+                ),
+                validator: (v) => v!.isEmpty ? 'El código es obligatorio' : null,
+              ),
+            ],
+
+            const SizedBox(height: 24),
+            Text('Contacto de Emergencia', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 16),
+            
+            TextFormField(
+              controller: _emergencyNameController,
+              decoration: const InputDecoration(
+                labelText: 'Nombre contacto',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.contact_phone_outlined),
+              ),
+            ),
+            const SizedBox(height: 16),
+            
+            TextFormField(
+              controller: _emergencyPhoneController,
+              keyboardType: TextInputType.phone,
+              decoration: const InputDecoration(
+                labelText: 'Teléfono',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.phone_outlined),
+              ),
+            ),
+
+            const SizedBox(height: 32),
+            SizedBox(
+              width: double.infinity,
+              height: 54,
+              child: FilledButton(
+                onPressed: _saving ? null : _save,
+                child: _saving
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : const Text('Vincular Dispositivo', style: TextStyle(fontSize: 16)),
+              ),
+            ),
+          ],
         ),
       ),
     );
