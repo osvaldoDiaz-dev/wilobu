@@ -20,6 +20,8 @@ dependencies:
   firebase_auth: ^5.1.0
   cloud_firestore: ^5.0.0
 
+  flutter_blue_plus: ^1.32.8
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
